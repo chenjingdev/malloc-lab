@@ -14,6 +14,8 @@
 #include <assert.h>
 #include <unistd.h>
 #include <string.h>
+#include <stdbool.h>
+#include <stddef.h>
 
 #include "mm.h"
 #include "memlib.h"
@@ -74,6 +76,10 @@ team_t team = {
 #define NEXT_BLKP(bp) ((char *)(bp) + GET_SIZE(((char *)(bp)-WSIZE))) // 주어진 bp에 대해 다음 블록 시작주소 계산
 // 이전 페이로드 시작주소
 #define PREV_BLKP(bp) ((char *)(bp)-GET_SIZE(((char *)(bp)-DSIZE))) // 이전 시작주소 계산
+
+// 전역 변수로 병합 대기열을 관리
+static char *deferred_coalesce_queue = NULL;
+static bool defer_coalescing = false;
 
 /*
  * mm_init - initialize the malloc package.
@@ -149,36 +155,38 @@ static void *extend_heap(size_t words)
 
 void *mm_malloc(size_t size)
 {
-    size_t asize;      // 요청된 크기를 조정한 후의 크기
-    size_t extendsize; // 필요한 경우 힙을 확장할 크기
+    size_t asize;      // 조정된 사이즈
+    size_t extendsize; // 확장 크기
     char *bp;
 
-    if (size == 0)
-        return NULL;
-
-    // 블록 크기가 최소 블록 크기보다 작거나 같으면 최소 블록 크기를 사용
-    if (size <= DSIZE)
+    if (size == 0) // 크기가 0인 요청은 무효
     {
-        asize = 2 * DSIZE;
+        return NULL;
     }
-    else
+
+    if (size <= DSIZE) // 더블 워드 이하인 경우 최소 블록 크기로 반환
+    {
+        asize = 2 * DSIZE; // 8바이트는 더블 워드 정렬, 8바이트는 헤더와 풋터의 오버헤드를 위해
+    }
+    else // 더블워드 크기로 반올림
     {
         asize = DSIZE * ((size + (DSIZE) + (DSIZE - 1)) / DSIZE);
     }
 
-    // 적합한 자유 블록 탐색
-    if ((bp = find_fit(asize)) != NULL)
+    if ((bp = find_fit(asize)) != NULL) // asize에 맞는 자유 블록을 리스트에서 검색
     {
-        place(bp, asize);
-        return bp;
+        place(bp, asize); // 적합한 블록이 발견되면 이 블록을 요청된 크기에 맞게 할당
+        last_visited = bp;
+        return bp; // 해당 블록 포인터 리턴
     }
 
-    // 적당한 블록을 찾지 못했다면, 힙을 확장
-    extendsize = MAX(asize, CHUNKSIZE);
-    if ((bp = extend_heap(extendsize / WSIZE)) == NULL)
+    extendsize = MAX(asize, CHUNKSIZE);                 // 못찾을 경우 확장 크기 결정
+    if ((bp = extend_heap(extendsize / WSIZE)) == NULL) // 힙 확장
+    {
         return NULL;
-
-    place(bp, asize);
+    }
+    place(bp, asize); // 확장된 힙에서 할당 처리
+    last_visited = bp;
     return bp;
 }
 
@@ -201,31 +209,32 @@ void *mm_malloc(size_t size)
 //     return NULL;
 // }
 
-static void *find_fit(size_t asize)
+static void *find_fit(size_t adjusted_size)
 {
-    // Best-fit search
-    void *best_fit = NULL;
-    size_t smallest_diff = ~(size_t)0; // 초기 최소 차이값은 최대 가능한 값으로 설정
-    char *bp;
+    // Next-fit
+    char *bp = last_visited; // 초기화
 
-    for (bp = heap_listp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp))
+    for (bp = NEXT_BLKP(bp); GET_SIZE(HDRP(bp)) != 0; bp = NEXT_BLKP(bp)) // 힙의 끝까지
     {
-        if (!GET_ALLOC(HDRP(bp)) && asize <= GET_SIZE(HDRP(bp)))
+        if (!GET_ALLOC(HDRP(bp)) && GET_SIZE(HDRP(bp)) >= adjusted_size) // 요구 크기보다 크거나 같으면
         {
-            size_t diff = GET_SIZE(HDRP(bp)) - asize;
-            if (diff < smallest_diff)
-            {
-                best_fit = bp;
-                smallest_diff = diff;
-                if (diff == 0)
-                { // 완벽하게 일치하는 크기를 찾았다면 더 이상 탐색할 필요 없음
-                    break;
-                }
-            }
+            last_visited = bp;
+            return bp;
         }
     }
 
-    return best_fit;
+    bp = heap_listp;
+    while (bp < last_visited) // 못찾으면 처음부터 다시
+    {
+        bp = NEXT_BLKP(bp);
+        if (!GET_ALLOC(HDRP(bp)) && GET_SIZE(HDRP(bp)) >= adjusted_size)
+        {
+            last_visited = bp;
+            return bp;
+        }
+    }
+
+    return NULL;
 }
 
 // static void *find_fit(size_t asize)
@@ -274,13 +283,53 @@ static void place(void *bp, size_t asize)
 /*
  * mm_free - Freeing a block does nothing.
  */
+void add_to_coalesce_queue(char *bp)
+{
+    // 다음 블록을 가리키는 포인터를 현재 블록에 저장
+    *(char **)bp = deferred_coalesce_queue;
+    deferred_coalesce_queue = bp;
+}
+
+void process_coalesce_queue()
+{
+    char *bp = deferred_coalesce_queue;
+    char *next_bp;
+
+    while (bp != NULL)
+    {
+        next_bp = *(char **)bp; // 다음 대기열 블록 주소 가져오기
+        bp = coalesce(bp);      // 병합 수행
+        bp = next_bp;           // 다음 블록으로 이동
+    }
+
+    deferred_coalesce_queue = NULL; // 대기열 비우기
+}
+
 void mm_free(void *bp)
 {
-    size_t size = GET_SIZE(HDRP(bp)); // bp가 가리키는 블록의 헤더에서 크기를 읽어온다
+    size_t size = GET_SIZE(HDRP(bp));
 
-    PUT(HDRP(bp), PACK(size, 0)); // 헤더와 풋터를 자유 블록으로 업데이트
-    PUT(FTRP(bp), PACK(size, 0)); // 크기는 그대로 할당 비트만 0
-    coalesce(bp);                 // 해제된 블록이 자유 블록과 인접해 있을 경우 병합
+    PUT(HDRP(bp), PACK(size, 0));
+    PUT(FTRP(bp), PACK(size, 0));
+
+    if (defer_coalescing)
+    {
+        add_to_coalesce_queue(bp); // 병합 대기열에 추가
+    }
+    else
+    {
+        coalesce(bp); // 즉시 병합
+    }
+}
+
+void toggle_defer_coalescing(bool enable)
+{
+    defer_coalescing = enable;
+
+    if (!defer_coalescing)
+    {
+        process_coalesce_queue(); // 지연 병합 비활성화 시 대기열 처리
+    }
 }
 
 static void *coalesce(void *bp)
